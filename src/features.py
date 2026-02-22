@@ -15,41 +15,89 @@ def _device() -> str:
         return "cpu"
 
 
+# ── Model cache to avoid reloading for every bank ──
+_LOADED: dict[str, tuple] = {}
+
+
 def _load_backbone(model_name: str, fallback_model_name: str):
-    """Load a CLIP/SigLIP model, returning (processor, tokenizer, model, torch)."""
-    try:
-        import torch
-        from transformers import AutoModel, AutoProcessor, AutoTokenizer
+    """Load a CLIP/SigLIP/DFN model, returning (processor, tokenizer, model, torch, model_type).
 
-        processor = AutoProcessor.from_pretrained(model_name)
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name)
-        model.to(_device())
-        model.eval()
-        return (processor, tokenizer, model, torch)
-    except Exception:
-        import torch
-        from transformers import AutoModel, AutoProcessor, AutoTokenizer
+    model_type is 'clip' (has get_image_features) or 'siglip' (needs manual pooling).
+    Results are cached so repeated calls with the same model_name are free.
+    """
+    cache_key = model_name
+    if cache_key in _LOADED:
+        return _LOADED[cache_key]
 
-        processor = AutoProcessor.from_pretrained(fallback_model_name)
-        tokenizer = AutoTokenizer.from_pretrained(fallback_model_name)
-        model = AutoModel.from_pretrained(fallback_model_name)
-        model.to(_device())
-        model.eval()
-        return (processor, tokenizer, model, torch)
+    import torch
+    from transformers import AutoModel, AutoProcessor, AutoTokenizer
+
+    names_to_try = [model_name, fallback_model_name]
+    for name in names_to_try:
+        try:
+            processor = AutoProcessor.from_pretrained(name)
+            tokenizer = AutoTokenizer.from_pretrained(name)
+            model = AutoModel.from_pretrained(name)
+            dev = _device()
+            model.to(dev)
+            if dev == "cuda":
+                model.half()  # FP16 — ~2× faster, ~half VRAM
+            model.eval()
+
+            # Detect model type
+            model_type = "clip" if hasattr(model, "get_image_features") else "siglip"
+            result = (processor, tokenizer, model, torch, model_type)
+            _LOADED[cache_key] = result
+            return result
+        except Exception as exc:
+            if name == fallback_model_name:
+                raise RuntimeError(
+                    f"Could not load model {model_name} or fallback {fallback_model_name}"
+                ) from exc
+            continue
+
+    raise RuntimeError("No model loaded")
 
 
-def _to_numpy(output, torch_module):
-    """Convert a model output (tensor or BaseModelOutput) to a numpy array."""
+def _to_numpy(output, torch_module) -> np.ndarray:
+    """Convert any model output (tensor, BaseModelOutput, tuple) to numpy."""
     if isinstance(output, torch_module.Tensor):
         return output.detach().cpu().numpy()
-    # Some transformers versions return a model output object
     if hasattr(output, "pooler_output") and output.pooler_output is not None:
         return output.pooler_output.detach().cpu().numpy()
     if hasattr(output, "last_hidden_state"):
         return output.last_hidden_state[:, 0, :].detach().cpu().numpy()
-    # Fallback: treat as indexable tuple (pooled is usually second element)
-    return output[1].detach().cpu().numpy()
+    if isinstance(output, tuple):
+        return output[1].detach().cpu().numpy()
+    raise TypeError(f"Cannot convert {type(output).__name__} to numpy")
+
+
+def _get_image_features(model, processor, images: list[Image.Image], model_type: str, torch_module, device: str) -> np.ndarray:
+    """Extract image embeddings regardless of model type."""
+    inputs = processor(images=images, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    with torch_module.no_grad():
+        if model_type == "clip":
+            out = model.get_image_features(**inputs)
+        else:
+            out = model.vision_model(**inputs)
+
+    return _to_numpy(out, torch_module)
+
+
+def _get_text_features(model, tokenizer, prompts: list[str], model_type: str, torch_module, device: str) -> np.ndarray:
+    """Extract text embeddings regardless of model type."""
+    inputs = tokenizer(prompts, padding=True, truncation=True, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    with torch_module.no_grad():
+        if model_type == "clip":
+            out = model.get_text_features(**inputs)
+        else:
+            out = model.text_model(**inputs)
+
+    return _to_numpy(out, torch_module)
 
 
 def _simple_embed(img: Image.Image) -> np.ndarray:
@@ -86,16 +134,13 @@ def compute_embeddings(
         device = _device()
 
     try:
-        processor, _tokenizer, model, torch = _load_backbone(model_name, fallback_model_name)
+        processor, _tokenizer, model, torch, model_type = _load_backbone(model_name, fallback_model_name)
 
         all_embeds = []
         batches = range(0, len(frame_paths), batch_size)
         for i in tqdm(batches, desc="  embeddings", unit="batch", leave=True):
             batch = [Image.open(p).convert("RGB") for p in frame_paths[i : i + batch_size]]
-            inputs = processor(images=batch, return_tensors="pt")
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            with torch.no_grad():
-                emb = _to_numpy(model.get_image_features(**inputs), torch)
+            emb = _get_image_features(model, processor, batch, model_type, torch, device)
             all_embeds.append(emb)
         embeddings = np.concatenate(all_embeds, axis=0)
     except Exception:
@@ -121,10 +166,7 @@ def compute_text_features(
     if device is None:
         device = _device()
 
-    _processor, tokenizer, model, torch = _load_backbone(model_name, fallback_model_name)
+    _processor, tokenizer, model, torch, model_type = _load_backbone(model_name, fallback_model_name)
 
-    inputs = tokenizer(prompts, padding=True, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    return _get_text_features(model, tokenizer, prompts, model_type, torch, device)
 
-    with torch.no_grad():
-        return _to_numpy(model.get_text_features(**inputs), torch)

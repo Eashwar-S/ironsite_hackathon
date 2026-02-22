@@ -12,10 +12,12 @@ from tqdm import tqdm
 from .analytics import build_rankings, generate_insights, video_metrics
 from .blockers import detect_idle_blockers
 from .config import CONFIG
+from .descriptor_banks import BANKS, CAMERA_BANK
 from .features import _device, compute_embeddings, compute_text_features
 from .frames import extract_video_frames
 from .ingest import build_manifest
-from .model import DEFAULT_LABEL_PROMPTS, LABELS, zero_shot_classify
+from .model import LABELS, multi_axis_classify
+from .refined_labels import add_refined_segment_details, infer_refined_labels, refined_summary_from_frames
 from .motion import compute_motion_features
 from .report import generate_daily_report
 from .smoothing import majority_smooth, to_segments
@@ -59,7 +61,7 @@ def _choose_fps(requested_fps: float, manifest: pd.DataFrame) -> float:
 _MAX_RECOMMENDED_FPS = 10.0
 
 
-def run_pipeline(dataset: Path, out: Path, fps: float | None = None) -> None:
+def run_pipeline(dataset: Path, out: Path, fps: float | None = None, refined_labels: bool = False) -> None:
     fps = fps if fps is not None else CONFIG.fps
 
     device = _device()
@@ -83,14 +85,38 @@ def run_pipeline(dataset: Path, out: Path, fps: float | None = None) -> None:
             f"Recommended: ≤{_MAX_RECOMMENDED_FPS:.0f} fps."
         )
 
-    # Compute text features once for all videos
-    label_prompts = [DEFAULT_LABEL_PROMPTS[lbl] for lbl in LABELS]
-    text_features = compute_text_features(
-        label_prompts,
+    # Compute text features for each descriptor bank (once for all videos)
+    print("[descriptors] encoding text features for descriptor banks...")
+    bank_text_embeddings = []
+    bank_label_weights = []
+    bank_multipliers = []
+    for bank in BANKS:
+        emb = compute_text_features(
+            bank["descriptors"],
+            model_name=CONFIG.model_name,
+            fallback_model_name=CONFIG.fallback_model_name,
+            device=device,
+        )
+        bank_text_embeddings.append(emb)
+        # Build (S, C) label-weight matrix from the weights dict
+        weights_matrix = np.array(
+            [bank["weights"][d] for d in bank["descriptors"]], dtype=np.float64
+        )
+        bank_label_weights.append(weights_matrix)
+        bank_multipliers.append(bank["bank_weight"])
+
+    # Camera-state bank (confidence modifier)
+    camera_text_emb = compute_text_features(
+        CAMERA_BANK["descriptors"],
         model_name=CONFIG.model_name,
         fallback_model_name=CONFIG.fallback_model_name,
         device=device,
     )
+    camera_confidence = np.array(
+        [CAMERA_BANK["confidence"][d] for d in CAMERA_BANK["descriptors"]],
+        dtype=np.float64,
+    )
+    print(f"[descriptors] encoded {sum(e.shape[0] for e in bank_text_embeddings) + camera_text_emb.shape[0]} descriptors across {len(BANKS) + 1} banks")
 
     all_segments: dict[str, list[dict]] = {}
     all_metrics: list[dict] = []
@@ -149,16 +175,41 @@ def run_pipeline(dataset: Path, out: Path, fps: float | None = None) -> None:
             embeddings = embeddings[:n]
             merged = merged.iloc[:n].reset_index(drop=True)
 
-        pred, probs = zero_shot_classify(
-            embeddings, text_features, logit_scale=CONFIG.clip_logit_scale
+        pred, probs = multi_axis_classify(
+            embeddings,
+            bank_text_embeddings=bank_text_embeddings,
+            bank_label_weights=bank_label_weights,
+            bank_multipliers=bank_multipliers,
+            camera_text_embeddings=camera_text_emb,
+            camera_confidence=camera_confidence,
+            logit_scale=CONFIG.clip_logit_scale,
+            num_labels=len(LABELS),
         )
 
         smooth = majority_smooth(pred, CONFIG.smoothing_window)
         segments = to_segments(merged["t_sec"].to_numpy(), smooth, probs)
 
+        prob_df = pd.DataFrame(probs, columns=[f"p_{l.lower()}" for l in LABELS])
+        per_frame = pd.concat(
+            [merged[["video_id", "t_sec", "frame_path", "diff_energy"]], prob_df], axis=1
+        )
+        per_frame["coarse_label_raw"] = [LABELS[i] for i in pred]
+        per_frame["coarse_label_smoothed"] = [LABELS[i] for i in smooth]
+
+        if refined_labels:
+            refined_df = infer_refined_labels(video_id, per_frame, CONFIG)
+            per_frame = per_frame.merge(
+                refined_df[["t_sec", "refined_label", "refined_confidence", "refined_reason", "trigger_evidence"]],
+                on="t_sec",
+                how="left",
+            )
+            segments = add_refined_segment_details(segments, per_frame)
+
         all_segments[video_id] = segments
 
         metric = video_metrics(video_id, person_id, task, segments, CONFIG.idle_burst_seconds)
+        if refined_labels:
+            metric["refined_summary"] = refined_summary_from_frames(per_frame)
         try:
             blocker_data = detect_idle_blockers(video_id, segments, frame_index, CONFIG)
             metric["idle_blockers"] = blocker_data["idle_blockers"]
@@ -174,18 +225,17 @@ def run_pipeline(dataset: Path, out: Path, fps: float | None = None) -> None:
         metric["insights"] = generate_insights(metric)
         all_metrics.append(metric)
 
-        prob_df = pd.DataFrame(probs, columns=[f"p_{l.lower()}" for l in LABELS])
-        per_frame = pd.concat(
-            [merged[["video_id", "t_sec", "frame_path", "diff_energy"]], prob_df], axis=1
-        )
-        per_frame["label_raw"] = [LABELS[i] for i in pred]
-        per_frame["label_smoothed"] = [LABELS[i] for i in smooth]
+        per_frame["label_raw"] = per_frame["coarse_label_raw"]
+        per_frame["label_smoothed"] = per_frame["coarse_label_smoothed"]
         per_frame.to_csv(out / f"{video_id}_frame_predictions.csv", index=False)
+        if refined_labels:
+            per_frame.to_csv(out / f"{video_id}_frame_predictions_refined.csv", index=False)
 
     weights = {
         "w_working": CONFIG.w_working,
         "w_idle": CONFIG.w_idle,
         "w_transit": CONFIG.w_transit,
+        "w_downtime": CONFIG.w_downtime,
         "w_transitions": CONFIG.w_transitions,
         "w_idle_bursts": CONFIG.w_idle_bursts,
     }
@@ -219,9 +269,16 @@ def main() -> None:
         default=CONFIG.fps,
         help="Extraction fps. Omit (or set to 1.0 default) to auto-detect from video.",
     )
+    parser.add_argument(
+        "--refined_labels",
+        type=str,
+        default="false",
+        choices=["true", "false"],
+        help="Enable refined per-frame VLM labels and segment enrichment.",
+    )
     args = parser.parse_args()
 
-    run_pipeline(args.dataset, args.out, args.fps)
+    run_pipeline(args.dataset, args.out, args.fps, refined_labels=args.refined_labels == "true")
 
 
 if __name__ == "__main__":

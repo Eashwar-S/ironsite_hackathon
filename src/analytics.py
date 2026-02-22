@@ -15,6 +15,7 @@ def video_metrics(video_id: str, person_id: str, task: str, segments: list[dict]
     working = _sum_dur(segments, "WORKING")
     idle = _sum_dur(segments, "IDLE")
     transit = _sum_dur(segments, "TRANSIT")
+    downtime = _sum_dur(segments, "DOWNTIME")
 
     transitions = max(len(segments) - 1, 0)
     transitions_per_min = transitions / (total / 60.0)
@@ -31,6 +32,7 @@ def video_metrics(video_id: str, person_id: str, task: str, segments: list[dict]
         "working_pct": working / total,
         "idle_pct": idle / total,
         "transit_pct": transit / total,
+        "downtime_pct": downtime / total,
         "transitions_per_min": transitions_per_min,
         "idle_burst_count": idle_burst_count,
         "idle_burst_total_sec": idle_burst_total,
@@ -38,12 +40,21 @@ def video_metrics(video_id: str, person_id: str, task: str, segments: list[dict]
 
 
 def score_metric(m: dict, w: dict) -> tuple[float, dict]:
+    refined_summary = m.get("refined_summary", {}) or {}
+    refined_time = refined_summary.get("time_sec_by_refined_label", {})
+    total_refined = max(sum(refined_time.values()), 1)
+    idle_waiting_ratio = refined_time.get("IDLE_WAITING", 0) / total_refined
+    working_pause_ratio = refined_time.get("WORKING_PAUSE", 0) / total_refined
+
     breakdown = {
         "working": w["w_working"] * m["working_pct"],
         "idle_penalty": -w["w_idle"] * m["idle_pct"],
         "transit_penalty": -w["w_transit"] * m["transit_pct"],
+        "downtime_penalty": -w.get("w_downtime", w["w_idle"]) * m.get("downtime_pct", 0.0),
         "transition_penalty": -w["w_transitions"] * m["transitions_per_min"],
         "idle_burst_penalty": -w["w_idle_bursts"] * (m["idle_burst_count"] + m["idle_burst_total_sec"] / 60.0),
+        "refined_idle_waiting_penalty": -0.15 * idle_waiting_ratio,
+        "refined_working_pause_penalty": -0.10 * working_pause_ratio,
     }
     return sum(breakdown.values()), breakdown
 
@@ -100,7 +111,7 @@ def build_productivity_heatmap(metrics: list[dict], segments_by_video: dict, day
         vid = metric["video_id"]
         segs = segments_by_video.get(vid, [])
         worker = metric.get("person_id", vid)
-        hourly: dict[int, dict[str, float]] = defaultdict(lambda: {"WORKING": 0.0, "IDLE": 0.0, "TRANSIT": 0.0})
+        hourly: dict[int, dict[str, float]] = defaultdict(lambda: {"WORKING": 0.0, "IDLE": 0.0, "TRANSIT": 0.0, "DOWNTIME": 0.0})
         for seg in segs:
             seg_start = float(seg["start_sec"])
             seg_end = float(seg["end_sec"])
@@ -113,7 +124,7 @@ def build_productivity_heatmap(metrics: list[dict], segments_by_video: dict, day
                 cursor = hour_end
 
         for hour_idx, vals in hourly.items():
-            total = max(vals["WORKING"] + vals["IDLE"] + vals["TRANSIT"], 1e-8)
+            total = max(vals["WORKING"] + vals["IDLE"] + vals["TRANSIT"] + vals["DOWNTIME"], 1e-8)
             bucket_time = (start_dt + timedelta(hours=hour_idx)).strftime("%H:00")
             rows.append(
                 {
@@ -123,9 +134,11 @@ def build_productivity_heatmap(metrics: list[dict], segments_by_video: dict, day
                     "working_pct": vals["WORKING"] / total,
                     "idle_pct": vals["IDLE"] / total,
                     "transit_pct": vals["TRANSIT"] / total,
+                    "downtime_pct": vals["DOWNTIME"] / total,
                     "working_sec": vals["WORKING"],
                     "idle_sec": vals["IDLE"],
                     "transit_sec": vals["TRANSIT"],
+                    "downtime_sec": vals["DOWNTIME"],
                 }
             )
     return pd.DataFrame(rows)

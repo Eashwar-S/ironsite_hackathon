@@ -18,7 +18,7 @@ class VLMRuntime:
     processor: Any
 
 
-_VLM_RUNTIME: VLMRuntime | None = None
+_VLM_RUNTIME: dict[tuple[str, bool], VLMRuntime] = {}
 _VLM_ERROR: str | None = None
 _MEMORY_CACHE: dict[str, str] = {}
 
@@ -52,10 +52,13 @@ def _hash_payload(images: list[Image.Image], prompt: str) -> str:
     return h.hexdigest()
 
 
-def load_vlm() -> VLMRuntime:
+def load_vlm(model_name: str | None = None, use_4bit: bool | None = None) -> VLMRuntime:
     global _VLM_RUNTIME, _VLM_ERROR
-    if _VLM_RUNTIME is not None:
-        return _VLM_RUNTIME
+    model_name = model_name or CONFIG.vlm_model
+    use_4bit = CONFIG.vlm_4bit if use_4bit is None else use_4bit
+    key = (model_name, use_4bit)
+    if key in _VLM_RUNTIME:
+        return _VLM_RUNTIME[key]
     if _VLM_ERROR:
         raise RuntimeError(_VLM_ERROR)
 
@@ -71,7 +74,7 @@ def load_vlm() -> VLMRuntime:
         raise RuntimeError(_VLM_ERROR)
 
     model_kwargs: dict[str, Any] = {}
-    if CONFIG.vlm_4bit:
+    if use_4bit:
         try:
             model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
             model_kwargs["device_map"] = "auto"
@@ -82,24 +85,33 @@ def load_vlm() -> VLMRuntime:
         model_kwargs["torch_dtype"] = torch.float16
 
     token = CONFIG.hf_token or None
-    processor = AutoProcessor.from_pretrained(CONFIG.vlm_model, token=token, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(model_name, token=token, trust_remote_code=True)
     model = AutoModelForImageTextToText.from_pretrained(
-        CONFIG.vlm_model,
+        model_name,
         token=token,
         trust_remote_code=True,
         **model_kwargs,
     )
-    if not CONFIG.vlm_4bit:
+    if not use_4bit:
         model = model.to(CONFIG.vlm_device)
-    _VLM_RUNTIME = VLMRuntime(model=model, processor=processor)
-    return _VLM_RUNTIME
+    _VLM_RUNTIME[key] = VLMRuntime(model=model, processor=processor)
+    return _VLM_RUNTIME[key]
 
 
-def vlm_infer(images: list[Image.Image], prompt: str) -> str:
+def vlm_infer(
+    images: list[Image.Image],
+    prompt: str,
+    *,
+    model_name: str | None = None,
+    use_4bit: bool | None = None,
+    max_new_tokens: int | None = None,
+    temperature: float | None = None,
+) -> str:
     if not images:
         raise ValueError("vlm_infer requires at least one image.")
 
-    cache_key = _hash_payload(images, prompt)
+    cache_discriminator = f"{model_name or CONFIG.vlm_model}:{use_4bit if use_4bit is not None else CONFIG.vlm_4bit}:{max_new_tokens or CONFIG.vlm_max_new_tokens}:{temperature if temperature is not None else CONFIG.vlm_temperature}"
+    cache_key = _hash_payload(images, f"{cache_discriminator}\n{prompt}")
     if cache_key in _MEMORY_CACHE:
         return _MEMORY_CACHE[cache_key]
 
@@ -108,7 +120,7 @@ def vlm_infer(images: list[Image.Image], prompt: str) -> str:
         _MEMORY_CACHE[cache_key] = disk_cache[cache_key]
         return disk_cache[cache_key]
 
-    runtime = load_vlm()
+    runtime = load_vlm(model_name=model_name, use_4bit=use_4bit)
     processor = runtime.processor
     model = runtime.model
 
@@ -124,9 +136,9 @@ def vlm_infer(images: list[Image.Image], prompt: str) -> str:
 
     output_ids = model.generate(
         **inputs,
-        max_new_tokens=CONFIG.vlm_max_new_tokens,
-        temperature=CONFIG.vlm_temperature,
-        do_sample=CONFIG.vlm_temperature > 0,
+        max_new_tokens=max_new_tokens or CONFIG.vlm_max_new_tokens,
+        temperature=CONFIG.vlm_temperature if temperature is None else temperature,
+        do_sample=(CONFIG.vlm_temperature if temperature is None else temperature) > 0,
     )
     generated = output_ids[:, inputs["input_ids"].shape[-1] :]
     text = processor.batch_decode(generated, skip_special_tokens=True)[0].strip()

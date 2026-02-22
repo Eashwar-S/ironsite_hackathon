@@ -20,16 +20,17 @@ class Config:
     batch_size: int = int(os.getenv("BATCH_SIZE", "32"))
     num_workers: int = int(os.getenv("NUM_WORKERS", "0"))
 
-    model_name: str = os.getenv("MODEL_NAME", "google/siglip-base-patch16-224")
-    fallback_model_name: str = os.getenv("FALLBACK_MODEL_NAME", "openai/clip-vit-base-patch32")
+    model_name: str = os.getenv("MODEL_NAME", "google/siglip-so400m-patch14-384")
+    fallback_model_name: str = os.getenv("FALLBACK_MODEL_NAME", "openai/clip-vit-large-patch14-336")
 
-    clip_logit_scale: float = float(os.getenv("CLIP_LOGIT_SCALE", "100.0"))
+    clip_logit_scale: float = float(os.getenv("CLIP_LOGIT_SCALE", "25.0"))
     smoothing_window: int = int(os.getenv("SMOOTHING_WINDOW", "9"))
     idle_burst_seconds: float = float(os.getenv("IDLE_BURST_SECONDS", "8"))
 
     w_working: float = float(os.getenv("W_WORKING", "1.0"))
     w_idle: float = float(os.getenv("W_IDLE", "0.8"))
     w_transit: float = float(os.getenv("W_TRANSIT", "0.5"))
+    w_downtime: float = float(os.getenv("W_DOWNTIME", "0.8"))
     w_transitions: float = float(os.getenv("W_TRANSITIONS", "0.2"))
     w_idle_bursts: float = float(os.getenv("W_IDLE_BURSTS", "0.15"))
 
@@ -39,6 +40,15 @@ class Config:
     vlm_4bit: bool = os.getenv("VLM_4BIT", "false").lower() in {"1", "true", "yes"}
     vlm_max_new_tokens: int = int(os.getenv("VLM_MAX_NEW_TOKENS", "256"))
     vlm_temperature: float = float(os.getenv("VLM_TEMPERATURE", "0.2"))
+
+    refined_vlm_model: str = os.getenv("REFINED_VLM_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct")
+    refined_vlm_4bit: bool = os.getenv("REFINED_VLM_4BIT", "true").lower() in {"1", "true", "yes"}
+    refined_infer_mode: str = os.getenv("REFINED_INFER_MODE", "selective")
+    refined_max_frames_per_video: int = int(os.getenv("REFINED_MAX_FRAMES_PER_VIDEO", "1200"))
+    refined_call_policy: str = os.getenv("REFINED_CALL_POLICY", "idle_and_pause")
+    refined_batch_size: int = int(os.getenv("REFINED_BATCH_SIZE", "4"))
+    refined_max_new_tokens: int = int(os.getenv("REFINED_MAX_NEW_TOKENS", "200"))
+    refined_temperature: float = float(os.getenv("REFINED_TEMPERATURE", "0.1"))
 
     idle_burst_sec: float = float(os.getenv("IDLE_BURST_SEC", "20"))
     blocker_frame_sample_fps: float = float(os.getenv("BLOCKER_FRAME_SAMPLE_FPS", "1"))

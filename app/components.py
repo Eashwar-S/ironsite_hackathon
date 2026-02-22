@@ -5,8 +5,8 @@ import json
 import pandas as pd
 import plotly.express as px
 
-COLOR_MAP   = {"WORKING": "#2ca02c", "IDLE": "#d62728", "TRANSIT": "#1f77b4"}
-LABEL_ORDER = ["IDLE", "TRANSIT", "WORKING"]
+COLOR_MAP   = {"WORKING": "#2ca02c", "IDLE": "#d62728", "TRANSIT": "#1f77b4", "DOWNTIME": "#ff7f0e"}
+LABEL_ORDER = ["IDLE", "TRANSIT", "WORKING", "DOWNTIME"]
 
 
 def canvas_timeline_html(segments: list[dict], current_t: float = 0.0) -> str:
@@ -76,6 +76,7 @@ def canvas_timeline_html(segments: list[dict], current_t: float = 0.0) -> str:
     <div class="leg"><div class="dot" style="background:#d62728"></div>IDLE</div>
     <div class="leg"><div class="dot" style="background:#1f77b4"></div>TRANSIT</div>
     <div class="leg"><div class="dot" style="background:#2ca02c"></div>WORKING</div>
+    <div class="leg"><div class="dot" style="background:#ff7f0e"></div>DOWNTIME</div>
   </div>
 </div>
 
@@ -170,11 +171,12 @@ draw(currentT);
 
 def metrics_table(metrics: dict) -> pd.DataFrame:
     return pd.DataFrame({
-        "Metric": ["Working %", "Idle %", "Transit %", "Transitions/min", "Idle burst count"],
+        "Metric": ["Working %", "Idle %", "Transit %", "Downtime %", "Transitions/min", "Idle burst count"],
         "Value": [
             f"{metrics.get('working_pct', 0) * 100:.1f}%",
             f"{metrics.get('idle_pct', 0) * 100:.1f}%",
             f"{metrics.get('transit_pct', 0) * 100:.1f}%",
+            f"{metrics.get('downtime_pct', 0) * 100:.1f}%",
             f"{metrics.get('transitions_per_min', 0):.2f}",
             str(int(metrics.get("idle_burst_count", 0))),
         ],
@@ -185,7 +187,20 @@ def blocker_chart(summary: dict):
     data = summary.get("counts_by_category", {}) if summary else {}
     if not data:
         return None
-    df = pd.DataFrame({"category": list(data.keys()), "count": list(data.values())})
-    fig = px.bar(df, x="category", y="count", title="Idle blockers by category")
+    dur_data = summary.get("category_duration_sec", {}) if summary else {}
+    df = pd.DataFrame(
+        {
+            "category": list(data.keys()),
+            "count": [data[k] for k in data.keys()],
+            "seconds": [dur_data.get(k, 0.0) for k in data.keys()],
+        }
+    )
+    fig = px.bar(
+        df,
+        x="category",
+        y=["count", "seconds"],
+        barmode="group",
+        title="Idle blockers by category (count + seconds)",
+    )
     fig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10))
     return fig

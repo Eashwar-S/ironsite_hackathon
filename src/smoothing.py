@@ -4,7 +4,7 @@ from collections import Counter
 import numpy as np
 
 
-LABELS = ["IDLE", "WORKING", "TRANSIT"]
+LABELS = ["IDLE", "WORKING", "TRANSIT", "DOWNTIME"]
 
 
 def majority_smooth(labels: np.ndarray, window: int = 9) -> np.ndarray:
